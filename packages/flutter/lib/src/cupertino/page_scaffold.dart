@@ -1,9 +1,10 @@
-// Copyright 2017 The Chromium Authors. All rights reserved.
+// Copyright 2014 The Flutter Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 import 'package:flutter/widgets.dart';
 
+import 'colors.dart';
 import 'theme.dart';
 
 /// Implements a single iOS application page's layout.
@@ -110,8 +111,7 @@ class _CupertinoPageScaffoldState extends State<CupertinoPageScaffold> {
           ? existingMediaQuery.viewInsets.copyWith(bottom: 0.0)
           : existingMediaQuery.viewInsets;
 
-      final bool fullObstruction =
-        widget.navigationBar.fullObstruction ?? CupertinoTheme.of(context).barBackgroundColor.alpha == 0xFF;
+      final bool fullObstruction = widget.navigationBar.shouldFullyObstruct(context);
 
       // If navigation bar is opaquely obstructing, directly shift the main content
       // down. If translucent, let main content draw behind navigation bar but hint the
@@ -157,7 +157,8 @@ class _CupertinoPageScaffoldState extends State<CupertinoPageScaffold> {
 
     return DecoratedBox(
       decoration: BoxDecoration(
-        color: widget.backgroundColor ?? CupertinoTheme.of(context).scaffoldBackgroundColor,
+        color: CupertinoDynamicColor.resolve(widget.backgroundColor, context)
+            ?? CupertinoTheme.of(context).scaffoldBackgroundColor,
       ),
       child: Stack(
         children: <Widget>[
@@ -199,10 +200,10 @@ class _CupertinoPageScaffoldState extends State<CupertinoPageScaffold> {
 ///
 /// Used by [CupertinoPageScaffold] to either shift away fully obstructed content
 /// or provide a padding guide to partially obstructed content.
-abstract class ObstructingPreferredSizeWidget extends PreferredSizeWidget {
+abstract class ObstructingPreferredSizeWidget implements PreferredSizeWidget {
   /// If true, this widget fully obstructs widgets behind it by the specified
   /// size.
   ///
   /// If false, this widget partially obstructs.
-  bool get fullObstruction;
+  bool shouldFullyObstruct(BuildContext context);
 }

@@ -1,4 +1,4 @@
-// Copyright 2016 The Chromium Authors. All rights reserved.
+// Copyright 2014 The Flutter Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -7,9 +7,11 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/scheduler.dart';
 
 import 'asset_bundle.dart';
 import 'binary_messenger.dart';
+import 'system_channels.dart';
 
 /// Listens for platform messages and directs them to the [defaultBinaryMessenger].
 ///
@@ -17,15 +19,17 @@ import 'binary_messenger.dart';
 /// the licenses found in the `LICENSE` file stored at the root of the asset
 /// bundle, and implements the `ext.flutter.evict` service extension (see
 /// [evict]).
-mixin ServicesBinding on BindingBase {
+mixin ServicesBinding on BindingBase, SchedulerBinding {
   @override
   void initInstances() {
     super.initInstances();
     _instance = this;
     _defaultBinaryMessenger = createBinaryMessenger();
-    window
-      ..onPlatformMessage = defaultBinaryMessenger.handlePlatformMessage;
+    window.onPlatformMessage = defaultBinaryMessenger.handlePlatformMessage;
     initLicenses();
+    SystemChannels.system.setMessageHandler(handleSystemMessage);
+    SystemChannels.lifecycle.setMessageHandler(_handleLifecycleMessage);
+    readInitialLifecycleStateFromNativeWindow();
   }
 
   /// The current [ServicesBinding], if one has been created.
@@ -45,6 +49,33 @@ mixin ServicesBinding on BindingBase {
   @protected
   BinaryMessenger createBinaryMessenger() {
     return const _DefaultBinaryMessenger._();
+  }
+
+
+  /// Called when the operating system notifies the application of a memory
+  /// pressure situation.
+  ///
+  /// This method exposes the `memoryPressure` notification from
+  /// [SystemChannels.system].
+  @protected
+  @mustCallSuper
+  void handleMemoryPressure() { }
+
+  /// Handler called for messages received on the [SystemChannels.system]
+  /// message channel.
+  ///
+  /// Other bindings may override this to respond to incoming system messages.
+  @protected
+  @mustCallSuper
+  Future<void> handleSystemMessage(Object systemMessage) async {
+    final Map<String, dynamic> message = systemMessage as Map<String, dynamic>;
+    final String type = message['type'] as String;
+    switch (type) {
+      case 'memoryPressure':
+        handleMemoryPressure();
+        break;
+    }
+    return;
   }
 
   /// Adds relevant licenses to the [LicenseRegistry].
@@ -91,7 +122,7 @@ mixin ServicesBinding on BindingBase {
     final String _licenseSeparator = '\n' + ('-' * 80) + '\n';
     final List<LicenseEntry> result = <LicenseEntry>[];
     final List<String> licenses = rawLicenses.split(_licenseSeparator);
-    for (String license in licenses) {
+    for (final String license in licenses) {
       final int split = license.indexOf('\n\n');
       if (split >= 0) {
         result.add(LicenseEntryWithLineBreaks(
@@ -133,6 +164,48 @@ mixin ServicesBinding on BindingBase {
   @mustCallSuper
   void evict(String asset) {
     rootBundle.evict(asset);
+  }
+
+  // App life cycle
+
+  /// Initializes the [lifecycleState] with the [initialLifecycleState] from the
+  /// window.
+  ///
+  /// Once the [lifecycleState] is populated through any means (including this
+  /// method), this method will do nothing. This is because the
+  /// [initialLifecycleState] may already be stale and it no longer makes sense
+  /// to use the initial state at dart vm startup as the current state anymore.
+  ///
+  /// The latest state should be obtained by subscribing to
+  /// [WidgetsBindingObserver.didChangeAppLifecycleState].
+  @protected
+  void readInitialLifecycleStateFromNativeWindow() {
+    if (lifecycleState != null) {
+      return;
+    }
+    final AppLifecycleState state = _parseAppLifecycleMessage(window.initialLifecycleState);
+    if (state != null) {
+      handleAppLifecycleStateChanged(state);
+    }
+  }
+
+  Future<String> _handleLifecycleMessage(String message) async {
+    handleAppLifecycleStateChanged(_parseAppLifecycleMessage(message));
+    return null;
+  }
+
+  static AppLifecycleState _parseAppLifecycleMessage(String message) {
+    switch (message) {
+      case 'AppLifecycleState.paused':
+        return AppLifecycleState.paused;
+      case 'AppLifecycleState.resumed':
+        return AppLifecycleState.resumed;
+      case 'AppLifecycleState.inactive':
+        return AppLifecycleState.inactive;
+      case 'AppLifecycleState.detached':
+        return AppLifecycleState.detached;
+    }
+    return null;
   }
 }
 
@@ -190,6 +263,7 @@ class _DefaultBinaryMessenger extends BinaryMessenger {
         response = await handler(data);
       } else {
         ui.channelBuffers.push(channel, data, callback);
+        callback = null;
       }
     } catch (exception, stack) {
       FlutterError.reportError(FlutterErrorDetails(
@@ -199,7 +273,9 @@ class _DefaultBinaryMessenger extends BinaryMessenger {
         context: ErrorDescription('during a platform message callback'),
       ));
     } finally {
-      callback(response);
+      if (callback != null) {
+        callback(response);
+      }
     }
   }
 

@@ -1,4 +1,4 @@
-// Copyright 2019 The Chromium Authors. All rights reserved.
+// Copyright 2014 The Flutter Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -7,10 +7,13 @@ import 'dart:collection';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:meta/meta.dart';
+import 'package:pool/pool.dart';
 
 import '../base/file_system.dart';
+import '../base/logger.dart';
+import '../base/utils.dart';
 import '../convert.dart';
-import '../globals.dart';
 import 'build_system.dart';
 
 /// An encoded representation of all file hashes.
@@ -18,12 +21,11 @@ class FileStorage {
   FileStorage(this.version, this.files);
 
   factory FileStorage.fromBuffer(Uint8List buffer) {
-    final Map<String, Object> json = jsonDecode(utf8.decode(buffer));
-    final int version = json['version'];
-    final List<Object> rawCachedFiles = json['files'];
+    final Map<String, dynamic> json = castStringKeyedMap(jsonDecode(utf8.decode(buffer)));
+    final int version = json['version'] as int;
+    final List<Map<String, Object>> rawCachedFiles = (json['files'] as List<dynamic>).cast<Map<String, Object>>();
     final List<FileHash> cachedFiles = <FileHash>[
-      for (Map<String, Object> rawFile in rawCachedFiles)
-        FileHash.fromJson(rawFile)
+      for (final Map<String, Object> rawFile in rawCachedFiles) FileHash.fromJson(rawFile),
     ];
     return FileStorage(version, cachedFiles);
   }
@@ -35,8 +37,7 @@ class FileStorage {
     final Map<String, Object> json = <String, Object>{
       'version': version,
       'files': <Object>[
-        for (FileHash file in files)
-          file.toJson()
+        for (final FileHash file in files) file.toJson(),
       ],
     };
     return utf8.encode(jsonEncode(json));
@@ -48,7 +49,7 @@ class FileHash {
   FileHash(this.path, this.hash);
 
   factory FileHash.fromJson(Map<String, Object> json) {
-    return FileHash(json['path'], json['hash']);
+    return FileHash(json['path'] as String, json['hash'] as String);
   }
 
   final String path;
@@ -70,20 +71,19 @@ class FileHash {
 /// operation, and persisted to cache in the root build directory.
 ///
 /// The format of the file store is subject to change and not part of its API.
-///
-/// To regenerate the protobuf entries used to construct the cache:
-///   1. If not already installed, https://developers.google.com/protocol-buffers/docs/downloads
-///   2. pub global active `protoc-gen-dart`
-///   3. protoc -I=lib/src/build_system/  --dart_out=lib/src/build_system/  lib/src/build_system/filecache.proto
-///   4. Add licenses headers to the newly generated file and check-in.
-///
-/// See also: https://developers.google.com/protocol-buffers/docs/darttutorial
-// TODO(jonahwilliams): find a better way to clear out old entries, perhaps
-// track the last access or modification date?
 class FileHashStore {
-  FileHashStore(this.environment);
+  FileHashStore({
+    @required Environment environment,
+    @required FileSystem fileSystem,
+    @required Logger logger,
+  }) : _cachePath = environment.buildDir.childFile(_kFileCache).path,
+       _logger = logger,
+       _fileSystem = fileSystem;
 
-  final Environment environment;
+  final FileSystem _fileSystem;
+  final String _cachePath;
+  final Logger _logger;
+
   final HashMap<String, String> previousHashes = HashMap<String, String>();
   final HashMap<String, String> currentHashes = HashMap<String, String>();
 
@@ -95,73 +95,101 @@ class FileHashStore {
 
   /// Read file hashes from disk.
   void initialize() {
-    printTrace('Initializing file store');
-    if (!_cacheFile.existsSync()) {
+    _logger.printTrace('Initializing file store');
+    final File cacheFile = _fileSystem.file(_cachePath);
+    if (!cacheFile.existsSync()) {
       return;
     }
-    final List<int> data = _cacheFile.readAsBytesSync();
+    Uint8List data;
+    try {
+      data = cacheFile.readAsBytesSync();
+    } on FileSystemException catch (err) {
+      _logger.printError(
+        'Failed to read file store at ${cacheFile.path} due to $err.\n'
+        'Build artifacts will not be cached. Try clearing the cache directories '
+        'with "flutter clean"',
+      );
+      return;
+    }
+
     FileStorage fileStorage;
     try {
       fileStorage = FileStorage.fromBuffer(data);
-    } on FormatException {
-      printTrace('Filestorage format changed');
-      _cacheFile.deleteSync();
+    } on Exception catch (err) {
+      _logger.printTrace('Filestorage format changed: $err');
+      cacheFile.deleteSync();
       return;
     }
     if (fileStorage.version != _kVersion) {
-      _cacheFile.deleteSync();
+      _logger.printTrace('file cache format updating, clearing old hashes.');
+      cacheFile.deleteSync();
       return;
     }
-    for (FileHash fileHash in fileStorage.files) {
+    for (final FileHash fileHash in fileStorage.files) {
       previousHashes[fileHash.path] = fileHash.hash;
     }
-    printTrace('Done initializing file store');
+    _logger.printTrace('Done initializing file store');
   }
 
   /// Persist file hashes to disk.
   void persist() {
-    printTrace('Persisting file store');
-    final File file = _cacheFile;
-    if (!file.existsSync()) {
-      file.createSync();
+    _logger.printTrace('Persisting file store');
+    final File cacheFile = _fileSystem.file(_cachePath);
+    if (!cacheFile.existsSync()) {
+      cacheFile.createSync(recursive: true);
     }
     final List<FileHash> fileHashes = <FileHash>[];
-    for (MapEntry<String, String> entry in currentHashes.entries) {
-      previousHashes[entry.key] = entry.value;
-    }
-    for (MapEntry<String, String> entry in previousHashes.entries) {
+    for (final MapEntry<String, String> entry in currentHashes.entries) {
       fileHashes.add(FileHash(entry.key, entry.value));
     }
     final FileStorage fileStorage = FileStorage(
       _kVersion,
       fileHashes,
     );
-    final Uint8List buffer = fileStorage.toBuffer();
-    file.writeAsBytesSync(buffer);
-    printTrace('Done persisting file store');
+    final List<int> buffer = fileStorage.toBuffer();
+    try {
+      cacheFile.writeAsBytesSync(buffer);
+    } on FileSystemException catch (err) {
+      _logger.printError(
+        'Failed to persist file store at ${cacheFile.path} due to $err.\n'
+        'Build artifacts will not be cached. Try clearing the cache directories '
+        'with "flutter clean"',
+      );
+    }
+    _logger.printTrace('Done persisting file store');
   }
 
   /// Computes a hash of the provided files and returns a list of entities
   /// that were dirty.
-  // TODO(jonahwilliams): compare hash performance with md5 tool on macOS and
-  // linux and certutil on Windows, as well as dividing up computation across
-  // isolates. This also related to the current performance issue with checking
-  // APKs before installing them on device.
   Future<List<File>> hashFiles(List<File> files) async {
     final List<File> dirty = <File>[];
-    for (File file in files) {
-      final String absolutePath = file.resolveSymbolicLinksSync();
-      final String previousHash = previousHashes[absolutePath];
-      final List<int> bytes = file.readAsBytesSync();
-      final String currentHash = md5.convert(bytes).toString();
+    final Pool openFiles = Pool(kMaxOpenFiles);
+    await Future.wait(<Future<void>>[
+       for (final File file in files) _hashFile(file, dirty, openFiles)
+    ]);
+    return dirty;
+  }
 
+  Future<void> _hashFile(File file, List<File> dirty, Pool pool) async {
+    final PoolResource resource = await pool.request();
+    try {
+      final String absolutePath = file.path;
+      final String previousHash = previousHashes[absolutePath];
+      // If the file is missing it is assumed to be dirty.
+      if (!file.existsSync()) {
+        currentHashes.remove(absolutePath);
+        previousHashes.remove(absolutePath);
+        dirty.add(file);
+        return;
+      }
+      final Digest digest = md5.convert(await file.readAsBytes());
+      final String currentHash = digest.toString();
       if (currentHash != previousHash) {
         dirty.add(file);
       }
       currentHashes[absolutePath] = currentHash;
+    } finally {
+      resource.release();
     }
-    return dirty;
   }
-
-  File get _cacheFile => environment.buildDir.childFile(_kFileCache);
 }

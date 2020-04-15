@@ -1,4 +1,4 @@
-// Copyright 2016 The Chromium Authors. All rights reserved.
+// Copyright 2014 The Flutter Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -19,7 +19,7 @@ void main() {
       final ProcessResult scriptProcess = processManager.runSync(<String>[
         dart,
         'bin/run.dart',
-        for (String testName in testNames) ...<String>['-t', testName],
+        for (final String testName in testNames) ...<String>['-t', testName],
       ]);
       return scriptProcess;
     }
@@ -53,7 +53,7 @@ void main() {
 
     test('exits with code 1 when fails to connect', () async {
       await expectScriptResult(<String>['smoke_test_setup_failure'], 1);
-    }, skip: true); // https://github.com/flutter/flutter/issues/5901
+    }, skip: true); // https://github.com/flutter/flutter/issues/53707
 
     test('exits with code 1 when results are mixed', () async {
       await expectScriptResult(<String>[

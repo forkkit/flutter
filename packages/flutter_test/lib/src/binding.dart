@@ -1,4 +1,4 @@
-// Copyright 2016 The Chromium Authors. All rights reserved.
+// Copyright 2014 The Flutter Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -15,6 +15,7 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart' show TestWindow;
 import 'package:quiver/testing/async.dart';
 import 'package:quiver/time.dart';
+// ignore: deprecated_member_use
 import 'package:test_api/test_api.dart' as test_package;
 import 'package:stack_trace/stack_trace.dart' as stack_trace;
 import 'package:vector_math/vector_math_64.dart';
@@ -146,9 +147,16 @@ class TestDefaultBinaryMessenger extends BinaryMessenger {
 ///
 /// When using these bindings, certain features are disabled. For
 /// example, [timeDilation] is reset to 1.0 on initialization.
+///
+/// In non-browser tests, the binding overrides `HttpClient` creation with a
+/// fake client that always returns a status code of 400. This is to prevent
+/// tests from making network calls, which could introduce flakiness. A test
+/// that actually needs to make a network call should provide its own
+/// `HttpClient` to the code making the call, so that it can appropriately mock
+/// or fake responses.
 abstract class TestWidgetsFlutterBinding extends BindingBase
-  with ServicesBinding,
-       SchedulerBinding,
+  with SchedulerBinding,
+       ServicesBinding,
        GestureBinding,
        SemanticsBinding,
        RendererBinding,
@@ -343,9 +351,6 @@ abstract class TestWidgetsFlutterBinding extends BindingBase
     return TestAsyncUtils.guard<void>(() async {
       assert(inTest);
       final Locale locale = Locale(languageCode, countryCode == '' ? null : countryCode);
-      if (isBrowser) {
-        return;
-      }
       dispatchLocalesChanged(<Locale>[locale]);
     });
   }
@@ -686,6 +691,9 @@ abstract class TestWidgetsFlutterBinding extends BindingBase
 
     runApp(Container(key: UniqueKey(), child: _preTestMessage)); // Reset the tree to a known state.
     await pump();
+    // Pretend that the first frame produced in the test body is the first frame
+    // sent to the engine.
+    resetFirstFrameSent();
 
     final bool autoUpdateGoldensBeforeTest = autoUpdateGoldenFiles && !isBrowser;
     final TestExceptionReporter reportTestExceptionBeforeTest = reportTestException;
@@ -796,10 +804,17 @@ abstract class TestWidgetsFlutterBinding extends BindingBase
     _pendingExceptionDetails = null;
     _parentZone = null;
     buildOwner.focusManager = FocusManager();
+    // Disabling the warning because @visibleForTesting doesn't take the testing
+    // framework itself into account, but we don't want it visible outside of
+    // tests.
+    // ignore: invalid_use_of_visible_for_testing_member
+    RawKeyboard.instance.clearKeysPressed();
     assert(!RendererBinding.instance.mouseTracker.mouseIsConnected,
         'The MouseTracker thinks that there is still a mouse connected, which indicates that a '
         'test has not removed the mouse pointer which it added. Call removePointer on the '
         'active mouse gesture to remove the mouse pointer.');
+    // ignore: invalid_use_of_visible_for_testing_member
+    RendererBinding.instance.initMouseTracker();
   }
 }
 
@@ -834,8 +849,11 @@ class AutomatedTestWidgetsFlutterBinding extends TestWidgetsFlutterBinding {
   @override
   bool get checkIntrinsicSizes => true;
 
+  /// The value of [defaultTestTimeout] can be set to `None` to enable debugging flutter tests where
+  /// we would not want to timeout the test. This is expected to be used by test tooling which
+  /// can detect debug mode.
   @override
-  test_package.Timeout get defaultTestTimeout => const test_package.Timeout(Duration(minutes: 10));
+  test_package.Timeout defaultTestTimeout = const test_package.Timeout(Duration(minutes: 10));
 
   @override
   bool get inTest => _currentFakeAsync != null;
@@ -952,6 +970,31 @@ class AutomatedTestWidgetsFlutterBinding extends TestWidgetsFlutterBinding {
     return result;
   }
 
+  int _firstFrameDeferredCount = 0;
+  bool _firstFrameSent = false;
+
+  @override
+  bool get sendFramesToEngine => _firstFrameSent || _firstFrameDeferredCount == 0;
+
+  @override
+  void deferFirstFrame() {
+    assert(_firstFrameDeferredCount >= 0);
+    _firstFrameDeferredCount += 1;
+  }
+
+  @override
+  void allowFirstFrame() {
+    assert(_firstFrameDeferredCount > 0);
+    _firstFrameDeferredCount -= 1;
+    // Unlike in RendererBinding.allowFirstFrame we do not force a frame her
+    // to give the test full control over frame scheduling.
+  }
+
+  @override
+  void resetFirstFrameSent() {
+    _firstFrameSent = false;
+  }
+
   EnginePhase _phase = EnginePhase.sendSemanticsUpdate;
 
   // Cloned from RendererBinding.drawFrame() but with early-exit semantics.
@@ -968,7 +1011,8 @@ class AutomatedTestWidgetsFlutterBinding extends TestWidgetsFlutterBinding {
           pipelineOwner.flushCompositingBits();
           if (_phase != EnginePhase.compositingBits) {
             pipelineOwner.flushPaint();
-            if (_phase != EnginePhase.paint) {
+            if (_phase != EnginePhase.paint && sendFramesToEngine) {
+              _firstFrameSent = true;
               renderView.compositeFrame(); // this sends the bits to the GPU
               if (_phase != EnginePhase.composite) {
                 pipelineOwner.flushSemantics();
@@ -1079,7 +1123,7 @@ class AutomatedTestWidgetsFlutterBinding extends TestWidgetsFlutterBinding {
       }
 
       debugPrint('Pending timers:');
-      for (String timerInfo in _currentFakeAsync.pendingTimersDebugInfo) {
+      for (final String timerInfo in _currentFakeAsync.pendingTimersDebugInfo) {
         final int firstLineEnd = timerInfo.indexOf('\n');
         assert(firstLineEnd != -1);
 
@@ -1322,7 +1366,7 @@ class LiveTestWidgetsFlutterBinding extends TestWidgetsFlutterBinding {
   }
 
   @override
-  _LiveTestRenderView get renderView => super.renderView;
+  _LiveTestRenderView get renderView => super.renderView as _LiveTestRenderView;
 
   void _handleViewNeedsPaint() {
     _viewNeedsPaint = true;
@@ -1564,7 +1608,7 @@ class _LiveTestRenderView extends RenderView {
   }) : super(configuration: configuration, window: window);
 
   @override
-  TestViewConfiguration get configuration => super.configuration;
+  TestViewConfiguration get configuration => super.configuration as TestViewConfiguration;
   @override
   set configuration(covariant TestViewConfiguration value) { super.configuration = value; }
 
@@ -1617,7 +1661,7 @@ class _LiveTestRenderView extends RenderView {
         ..strokeWidth = radius / 10.0
         ..style = PaintingStyle.stroke;
       bool dirty = false;
-      for (int pointer in _pointers.keys) {
+      for (final int pointer in _pointers.keys) {
         final _LiveTestPointerRecord record = _pointers[pointer];
         paint.color = record.color.withOpacity(record.decay < 0 ? (record.decay / (_kPointerDecay - 1)) : 1.0);
         canvas.drawPath(path.shift(record.position), paint);

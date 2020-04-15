@@ -1,4 +1,4 @@
-// Copyright 2019 The Chromium Authors. All rights reserved.
+// Copyright 2014 The Flutter Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -7,15 +7,12 @@ import 'package:meta/meta.dart';
 import '../application_package.dart';
 import '../base/file_system.dart';
 import '../base/io.dart';
-import '../base/platform.dart';
-import '../base/process_manager.dart';
 import '../build_info.dart';
 import '../device.dart';
 import '../features.dart';
-import '../globals.dart';
+import '../globals.dart' as globals;
 import '../project.dart';
 import 'chrome.dart';
-import 'workflow.dart';
 
 class WebApplicationPackage extends ApplicationPackage {
   WebApplicationPackage(this.flutterProject) : super(id: flutterProject.manifest.appName);
@@ -60,9 +57,14 @@ class ChromeDevice extends Device {
   @override
   void clearLogs() { }
 
+  DeviceLogReader _logReader;
+
   @override
-  DeviceLogReader getLogReader({ApplicationPackage app}) {
-    return NoOpDeviceLogReader(app.name);
+  DeviceLogReader getLogReader({
+    ApplicationPackage app,
+    bool includePastLogs = false,
+  }) {
+    return _logReader ??= NoOpDeviceLogReader(app?.name);
   }
 
   @override
@@ -81,7 +83,7 @@ class ChromeDevice extends Device {
   Future<String> get emulatorId async => null;
 
   @override
-  bool isSupported() =>  featureFlags.isWebEnabled && canFindChrome();
+  bool isSupported() =>  featureFlags.isWebEnabled && globals.chromeLauncher.canFindChrome();
 
   @override
   String get name => 'Chrome';
@@ -90,30 +92,33 @@ class ChromeDevice extends Device {
   DevicePortForwarder get portForwarder => const NoOpDevicePortForwarder();
 
   @override
-  Future<String> get sdkNameAndVersion async {
+  Future<String> get sdkNameAndVersion async => _sdkNameAndVersion ??= await _computeSdkNameAndVersion();
+
+  String _sdkNameAndVersion;
+  Future<String> _computeSdkNameAndVersion() async {
     if (!isSupported()) {
       return 'unknown';
     }
     // See https://bugs.chromium.org/p/chromium/issues/detail?id=158372
     String version = 'unknown';
-    if (platform.isWindows) {
-      final ProcessResult result = await processManager.run(<String>[
-        r'reg', 'query', 'HKEY_CURRENT_USER\\Software\\Google\\Chrome\\BLBeacon', '/v', 'version'
+    if (globals.platform.isWindows) {
+      final ProcessResult result = await globals.processManager.run(<String>[
+        r'reg', 'query', r'HKEY_CURRENT_USER\Software\Google\Chrome\BLBeacon', '/v', 'version',
       ]);
       if (result.exitCode == 0) {
-        final List<String> parts = result.stdout.split(RegExp(r'\s+'));
+        final List<String> parts = (result.stdout as String).split(RegExp(r'\s+'));
         if (parts.length > 2) {
           version = 'Google Chrome ' + parts[parts.length - 2];
         }
       }
     } else {
-      final String chrome = findChromeExecutable();
-      final ProcessResult result = await processManager.run(<String>[
+      final String chrome = findChromeExecutable(globals.platform, globals.fs);
+      final ProcessResult result = await globals.processManager.run(<String>[
         chrome,
         '--version',
       ]);
       if (result.exitCode == 0) {
-        version = result.stdout;
+        version = result.stdout as String;
       }
     }
     return version.trim();
@@ -131,8 +136,21 @@ class ChromeDevice extends Device {
   }) async {
     // See [ResidentWebRunner.run] in flutter_tools/lib/src/resident_web_runner.dart
     // for the web initialization and server logic.
-    _chrome = await chromeLauncher.launch(platformArgs['uri']);
-    return LaunchResult.succeeded(observatoryUri: null);
+    final String url = platformArgs['uri'] as String;
+    final bool launchChrome = platformArgs['no-launch-chrome'] != true;
+    if (launchChrome) {
+      _chrome = await globals.chromeLauncher.launch(
+        url,
+        cacheDir: globals.fs.currentDirectory
+            .childDirectory('.dart_tool')
+            .childDirectory('chrome-device'),
+        headless: debuggingOptions.webRunHeadless,
+        debugPort: debuggingOptions.webBrowserDebugPort,
+      );
+    }
+
+    globals.logger.sendEvent('app.webLaunchUrl', <String, dynamic>{'url': url, 'launched': launchChrome});
+    return LaunchResult.succeeded(observatoryUri: url != null ? Uri.parse(url): null);
   }
 
   @override
@@ -151,11 +169,18 @@ class ChromeDevice extends Device {
   bool isSupportedForProject(FlutterProject flutterProject) {
     return flutterProject.web.existsSync();
   }
+
+  @override
+  Future<void> dispose() async {
+    _logReader?.dispose();
+    await portForwarder?.dispose();
+  }
 }
 
 class WebDevices extends PollingDeviceDiscovery {
   WebDevices() : super('chrome');
 
+  final bool _chromeIsAvailable = globals.chromeLauncher.canFindChrome();
   final ChromeDevice _webDevice = ChromeDevice();
   final WebServerDevice _webServerDevice = WebServerDevice();
 
@@ -163,9 +188,10 @@ class WebDevices extends PollingDeviceDiscovery {
   bool get canListAnything => featureFlags.isWebEnabled;
 
   @override
-  Future<List<Device>> pollingGetDevices() async {
+  Future<List<Device>> pollingGetDevices({ Duration timeout }) async {
     return <Device>[
-      _webDevice,
+      if (_chromeIsAvailable)
+        _webDevice,
       _webServerDevice,
     ];
   }
@@ -176,14 +202,14 @@ class WebDevices extends PollingDeviceDiscovery {
 
 @visibleForTesting
 String parseVersionForWindows(String input) {
-  return input.split(RegExp('\w')).last;
+  return input.split(RegExp(r'\w')).last;
 }
 
 
 /// A special device type to allow serving for arbitrary browsers.
 class WebServerDevice extends Device {
   WebServerDevice() : super(
-    'web',
+    'web-server',
     platformType: PlatformType.web,
     category: Category.web,
     ephemeral: false,
@@ -195,9 +221,14 @@ class WebServerDevice extends Device {
   @override
   Future<String> get emulatorId => null;
 
+  DeviceLogReader _logReader;
+
   @override
-  DeviceLogReader getLogReader({ApplicationPackage app}) {
-    return NoOpDeviceLogReader(app.name);
+  DeviceLogReader getLogReader({
+    ApplicationPackage app,
+    bool includePastLogs = false,
+  }) {
+    return _logReader ??= NoOpDeviceLogReader(app?.name);
   }
 
   @override
@@ -221,7 +252,7 @@ class WebServerDevice extends Device {
   }
 
   @override
-  String get name => 'Server';
+  String get name => 'Web Server';
 
   @override
   DevicePortForwarder get portForwarder => const NoOpDevicePortForwarder();
@@ -238,9 +269,14 @@ class WebServerDevice extends Device {
     bool prebuiltApplication = false,
     bool ipv6 = false,
   }) async {
-    final String url = platformArgs['uri'];
-    printStatus('$mainPath is being served at $url', emphasis: true);
-    return LaunchResult.succeeded(observatoryUri: null);
+    final String url = platformArgs['uri'] as String;
+    if (debuggingOptions.startPaused) {
+      globals.printStatus('Waiting for connection from Dart debug extension at $url', emphasis: true);
+    } else {
+      globals.printStatus('$mainPath is being served at $url', emphasis: true);
+    }
+    globals.logger.sendEvent('app.webLaunchUrl', <String, dynamic>{'url': url, 'launched': false});
+    return LaunchResult.succeeded(observatoryUri: url != null ? Uri.parse(url): null);
   }
 
   @override
@@ -254,5 +290,11 @@ class WebServerDevice extends Device {
   @override
   Future<bool> uninstallApp(ApplicationPackage app) async {
     return true;
+  }
+
+  @override
+  Future<void> dispose() async {
+    _logReader?.dispose();
+    await portForwarder?.dispose();
   }
 }
